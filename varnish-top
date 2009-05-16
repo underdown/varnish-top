@@ -1,0 +1,349 @@
+#!/usr/bin/perl -w
+
+################################################################################
+# varnish-top.pl
+#
+# "top" for varnish - watch the traffic and other stats in real-time.  Yoikes.
+#
+# NOTES:
+#
+#   If Getopt::Long is installed:
+#     - Specify instances w/ --instances (multiple times or comma separated)
+#     - Specify default port w/ --port (defaults to 6082)
+#     - Specify sleep time w/ --sleep (default 3)
+#     - Specify color output w/ --color (default) or --nocolor
+#
+#   If Getopt::Long is not installed:
+#     - Specify sleep time by typing a number after the command.
+#   Specify instances in @default_instances.
+#   Specify thresholds by defining %threshold.
+#   Written against varnish v 2.0.2, but should work fine w/ later versions.
+#
+# HISTORY:
+#
+# v0.1 - 2009-05-16 - ntang
+#   First release.  Straight to google code!
+#   http://code.google.com/p/memcache-top/
+#
+################################################################################
+
+use strict;
+use IO::Socket;
+use Time::HiRes 'time';
+
+my (@default_instances, @instances, $remote, $sleep, %threshold, %laststats,
+    $usecolor, @keys, $default_port, $version, @out);
+    
+
+$version = "0.1";
+
+################################################################################
+# CONFIGURATION
+
+# Set $usecolor to 1 to push @out,in, gasp, color.
+$usecolor = 1;
+
+# 'Alert' threshold values at which to color the text red.
+%threshold = (
+    cache_hit		=> 60,		# Cache hit ratio
+    usage		=> 90,		# % space used
+    time		=> 5,		# Number of ms to run the stats query
+    n_expired_objects	=> 1,		# Number of expirations per sec
+    n_struct_object	=> 100000,	# Number of objects
+    n_lru_nuked_objects => 1,		# LRU nukes per sec.
+    total_requests	=> 1000,	# Requests per second
+);
+
+# Default time to sleep in-between refreshes.
+$sleep = 3;
+
+# List of servers/ ports to query.
+@default_instances = (
+  '127.0.0.1',
+);
+
+# Default port to connect to, if not specified
+$default_port = "6082";
+
+# END CONFIGURATION
+################################################################################
+
+@keys = ('cache_hit', 'cache_misses', 'total_requests', 'n_struct_object',
+         'bytes_allocated', 'bytes_free', 'n_expired_objects', 'time',
+         'n_lru_nuked_objects', 'total_bytes', 'cache_hits', 'usage');
+
+if (@ARGV) {
+  eval { require Getopt::Long; };
+  if ($@) {
+    if ( $ARGV[0] =~ /^\d+$/ ) {
+      $sleep = $ARGV[0];
+    }
+    else {
+      die "USAGE: varnish-top.pl <optional number of seconds to sleep>\n";
+    }
+  }
+  else {
+    use Getopt::Long;
+    GetOptions (
+      'instances=s'	=> \@instances,
+      'sleep=i'		=> \$sleep,
+      'port=i'		=> \$default_port,
+      'color!'		=> \$usecolor,
+    );
+    if (@instances) {
+      @instances = split(/,/,join(',',@instances));
+    } else {
+      @instances = @default_instances;
+    }
+  }
+}
+else {
+  @instances = @default_instances;
+}
+
+if ( $usecolor ) {
+  eval { require Term::ANSIColor; };
+  if ($@) { $usecolor = 0; }
+  else { use Term::ANSIColor; }
+}
+
+my $i = 1;
+
+my (%original);
+
+while ($i) {
+
+  @out = ();
+
+  push @out,"\033[2J";			# This clears the screen, yo.
+
+  push @out,color 'bold' if $usecolor;
+  push @out,"\nvarnish-top v$version\t";
+  push @out,color 'reset' if $usecolor;
+  push @out,"(default port: " . sprintf("%5d",$default_port) . ", color: ";
+  push @out,"on," if $usecolor;
+  push @out,"off," unless $usecolor;
+  push @out," refresh: $sleep seconds)\n\n";
+  push @out,color 'bold' if $usecolor;
+  push @out,"INSTANCE\t\tUSAGE\tHIT %\tTIME\tOBJs\t";
+  push @out,"EXPIR/s NUKED/s REQ/s";
+  push @out,"\n";
+  push @out,color 'reset' if $usecolor;
+
+  my %tot;
+
+  foreach my $key (@keys) {
+    $tot{$key} = 0;
+  }
+  
+  my $count = 0;
+
+  foreach my $instance (@instances) {
+
+    my ($port, $server);
+
+    my @split = split(/:/,$instance);
+    unless ( $split[1] ) {
+      $instance = $instance . ":" . $default_port;
+      $port = $default_port;
+    }
+    else {
+      $port = $split[1];
+    }
+
+# Some exhaustive (exhausting?) logic to determine the ideal text to push @out,for
+# the server name.
+    if ( length($instance) > 22 ) {
+      if ( $port ne $default_port ) {
+        $server = substr($split[0],0,17) . ":" . $port;
+      }
+      else {
+        if ( length($split[0]) < 18 ) {
+          $server = $instance;
+        }
+        else {
+          $server = substr($split[0],0,23);
+        }
+      }
+    }
+    elsif ( length($instance) < 8 ) {
+      $server = "$instance\t\t";
+    }
+    elsif ( length($instance) < 16 ) {
+      $server = "$instance\t";
+    }
+    else {
+      $server = $instance;
+    }
+
+    my $t0 = time();
+
+    $remote = IO::Socket::INET->new($instance);
+    unless ( defined($remote) ) { 
+      push @out,color 'red' if $usecolor;
+      push @out,$instance . " is DOWN.\n";
+      $count++;
+      push @out,color 'reset' if $usecolor;
+      next; 
+    }
+
+    $remote->autoflush(1);
+    $count++;
+
+    print $remote "stats\n";
+
+    my (%stats, %outstats);
+
+    foreach my $key (@keys) {
+      $outstats{$key} = 0;
+    }
+
+    LINE: while ( defined ( my $line = <$remote> ) ) {
+      last LINE if ( $line =~ /^\s*\n$/ );
+      chomp $line;
+      my @bits = split(' ',$line);
+      my $value = shift(@bits);
+      my $key = lc(join('_',@bits));
+      $stats{$key} = $value;
+      next LINE;
+    }
+
+    close $remote;
+
+    my $t1 = time();
+    $outstats{time} = ($t1 - $t0) * 1000;
+
+    
+    foreach my $key ('total_requests', 'n_expired_objects', 'n_lru_nuked_objects') {
+      if ( defined ( $laststats{$instance}{$key} ) ) {
+        $outstats{$key} = ($stats{$key} - $laststats{$instance}{$key}) / $sleep;
+      }
+    }
+
+    if ($laststats{$instance}{cache_hits}) {
+      $outstats{cache_hits} = $stats{cache_hits} - $laststats{$instance}{cache_hits};
+    }
+    if ($laststats{$instance}{cache_misses}) {
+      $outstats{cache_misses} = $stats{cache_misses} - $laststats{$instance}{cache_misses};
+    }
+    $outstats{cache_hit} = 0;
+    if ( defined($outstats{cache_hits}) && $outstats{cache_hits} > 0 && $outstats{total_requests} > 0 ) {
+      $outstats{cache_hit} = ( $outstats{cache_hits} / ( $stats{total_requests} - $laststats{$instance}{total_requests} ) ) * 100;
+    }
+
+    $outstats{total_bytes} = ( $stats{bytes_allocated} + $stats{bytes_free} );
+    $outstats{usage} = ( $stats{bytes_allocated} / $outstats{total_bytes} ) * 100;
+    $outstats{bytes_allocated} = $stats{bytes_allocated};
+    $outstats{n_struct_object} = $stats{n_struct_object};
+
+    push @out,"$server\t";
+    threshold_print( $outstats{usage}, $threshold{usage}, 1, 0, '%', '%.1f');
+    threshold_print( $outstats{cache_hit}, $threshold{cache_hit}, 0, 0, '%', '%.1f');
+    if ( $outstats{time} >= 1000 ) {
+      threshold_print( $outstats{time}/1000, $threshold{time}/1000, 1, 0, 's', '%.2f');
+    } else {
+      threshold_print( $outstats{time}, $threshold{time}, 1, 0, 'ms', '%.1f');
+    }
+    threshold_print( $outstats{n_struct_object}, $threshold{n_struct_object}, 1, 0, '', '%.0f');
+    threshold_print( $outstats{n_expired_objects}, $threshold{n_expired_objects}, 1, 0, '', '%.1f');
+    threshold_print( $outstats{n_lru_nuked_objects}, $threshold{n_lru_nuked_objects}, 1, 0, '', '%.1f');
+    threshold_print( $outstats{total_requests}, $threshold{total_requests}, 1, 0, '', '%.0f');
+    push @out,"\n";
+
+    foreach my $key (@keys) {
+      $tot{$key} = $tot{$key} + $outstats{$key};
+    }
+
+    foreach my $key (@keys) {
+      $laststats{$instance}{$key} = $stats{$key};
+    }
+
+  }
+
+  push @out,color 'bold' if $usecolor;
+  push @out,"\nAVERAGE:\t\t";
+  threshold_print( $tot{usage}/$count, $threshold{usage}, 1, 1, '%', '%.1f');
+  threshold_print( $tot{cache_hit}/$count, $threshold{cache_hit}, 0, 1, '%', '%.1f');
+  if ( ( $tot{time}/$count ) >= 1000 ) {
+    threshold_print( ($tot{time}/$count)/1000, $threshold{time}/1000, 1, 1, 's', '%.2f');
+  } else { 
+    threshold_print( $tot{time}/$count, $threshold{time}, 1, 1, 'ms', '%.1f');
+  }
+  threshold_print( $tot{n_struct_object}/$count, $threshold{n_struct_object}, 1, 1, '', '%.0f');
+  threshold_print( $tot{n_expired_objects}/$count, $threshold{n_expired_objects}, 1, 1, '', '%.1f');
+  threshold_print( $tot{n_lru_nuked_objects}/$count, $threshold{n_lru_nuked_objects}, 1, 1, '', '%.1f');
+  threshold_print( $tot{total_requests}/$count, $threshold{total_requests}, 1, 1, '', '%.0f');
+  push @out,"\n";
+  push @out,"\nTOTAL:\t\t";
+  threshold_print( $tot{bytes_allocated}, $threshold{bytes_allocated}, 0, 1, 'B/', '%.0f');
+  threshold_print( $tot{total_bytes}, $threshold{total_bytes}, 0, 1, "B\t", '%.0f');
+  if ( $tot{time} >= 1000 ) {
+    threshold_print( $tot{time}/1000, ($threshold{time}*$count)/1000, 1, 1, 's', '%.2f');
+  } else {
+    threshold_print( $tot{time}, $threshold{time}*$count, 1, 1, 'ms', '%.1f');
+  }
+  threshold_print( $tot{n_struct_object}, $threshold{n_struct_object}*$count, 1, 1, '', '%.0f');
+  threshold_print( $tot{n_expired_objects}, $threshold{n_expired_objects}*$count, 1, 1, '', '%.1f');
+  threshold_print( $tot{n_lru_nuked_objects}, $threshold{n_lru_nuked_objects}*$count, 1, 1, '', '%.1f');
+  threshold_print( $tot{total_requests}, $threshold{total_requests}*$count, 1, 1, '', '%.0f');
+  push @out,color 'reset' if $usecolor;
+  push @out,"\n(ctrl-c to quit.)\n";
+  sleep($sleep);
+
+  print @out;
+  $i++;
+}
+
+################################################################################
+# threshold_print
+# takes two variables, compares them (greater then if $gt == 1), and then prints
+# it.  It uses red as the default color for successful comparisons, but sets 
+# it to red bold if $bold == 1.  $trail specifies trailing characters to print.
+# $sprintf lets you specify the format for sprintf().
+#
+sub threshold_print { 
+
+  my ($stat, $threshold, $gt, $bold, $trail, $sprintf) = @_;
+
+  my $color = 'red';
+  my $offcolor = 'reset';
+  if ( $bold ) {
+    $color = 'bold red';
+    $offcolor = 'reset bold';
+  } 
+
+  if (defined ($threshold) ) {
+    if ( $gt ) {
+      if ( $stat > $threshold ) {
+        push @out, color $color if $usecolor;
+      }
+    } else {
+      if ( $stat < $threshold ) {
+        push @out, color $color if $usecolor;
+      }
+    }
+  }
+
+  if ( $stat > 999999999999 ) {
+    $stat = $stat / (1024*1024*1024*1024);
+    $trail = 'T' . $trail;
+    $sprintf = '%.1f';
+  } elsif ( $stat > 99999999 ) {
+    $stat = $stat / (1024*1024*1024);
+    $trail = "G" . $trail;
+    $sprintf = '%.1f';
+  } elsif ( $stat > 999999 ) {
+    $stat = $stat / (1024*1024);
+    $trail = 'M' . $trail;
+    $sprintf = '%.1f';
+  } elsif ( $stat > 9999 ) {
+    $stat = $stat/1024;
+    $trail = 'K' . $trail;
+    $sprintf = '%.1f';
+  }
+  
+  push @out,sprintf($sprintf,$stat) . $trail;
+  push @out,color $offcolor if $usecolor;
+  push @out,"\t";
+}
+################################################################################
